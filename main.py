@@ -1,132 +1,70 @@
-from unittest import result
-from urllib import response
+from dotenv import load_dotenv
+load_dotenv()
 
-from fastapi import FastAPI, HTTPException
-import pandas as pd
-from pathlib import Path
+import os
+import io
+import numpy as np
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from PIL import Image
 
-app = FastAPI(title="Garden Planner API")
+from model_loader import load_keras_model, predict_plant
+from plantnet import query_plantnet
 
-from fastapi.middleware.cors import CORSMiddleware
+app = FastAPI(title="Plant Identification API")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten this in production
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+MODEL_PATH = os.getenv("MODEL_PATH","Models/plant_identification_model.h5")
 
-# -------- PATH --------
-CURRENT_FILE = Path(__file__).resolve()
-BACKEND_DIR = CURRENT_FILE.parent.parent
+CLASS_NAMES_PATH = os.getenv("CLASS_NAMES_PATH","class_names.txt")
 
-PLANT_DATASET_PATH = BACKEND_DIR / "Textual_Datasets" / "GardenScannerData.xlsx"
-CARE_DATASET_PATH = BACKEND_DIR / "Textual_Datasets" / "CareGardenScanner.xlsx"
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD","0.6"))
 
-print("\n--- PATH DEBUG ---")
-print("Plant Dataset:", PLANT_DATASET_PATH, PLANT_DATASET_PATH.exists())
-print("Care Dataset:", CARE_DATASET_PATH, CARE_DATASET_PATH.exists())
-print("------------------\n")
+MODEL_PATH = r"D:\OJT sem4\Backend\Models\plant_efficientnet_model.keras"
+CLASS_NAMES_PATH = "class_names.txt"
+CONFIDENCE_THRESHOLD = 0.80
 
-def load_plant_data():
+model, class_names, img_size = load_keras_model(MODEL_PATH, CLASS_NAMES_PATH)
+
+@app.get("/health")
+def health():
+    return {"status":"ok", "model_loaded":model is not None}
+
+
+@app.post("/identify")
+async def identify_plant(file: UploadFile = File(...)):
+    if file.content_type not in ("image/jpeg", "image/png","image/webp"):
+        raise HTTPException(status_code=400, detail="Unsupported image format.")
+ 
+    raw = await file.read()
+    if len(raw) > 10 * 1024 * 1024:   # 10 MB cap
+        raise HTTPException(status_code=400, detail="Image too large (max 10 MB).")
+ 
     try:
-        df = pd.read_excel(PLANT_DATASET_PATH)
-        df.columns = df.columns.str.strip()
-        return df
-    except Exception as e:
-        print("PLANT LOAD ERROR:", e)
-        return None
-
-def load_care_data():
-    try:
-        df = pd.read_excel(CARE_DATASET_PATH)
-        df.columns = df.columns.str.strip()
-        return df
-    except Exception as e:
-        print("CARE LOAD ERROR:", e)
-        return None
-
-
-@app.get("/recommendations/")
-async def get_recommendations(diameter: float, height: float):
-    df = load_plant_data()
-
-    if df is None:
-        raise HTTPException(status_code=500, detail="Plant dataset failed to load")
-
-    required_cols = [
-        "MIN_DIAMETER",
-        "MAX_DIAMETER",
-        "MIN_HEIGHT",
-        "POT HEIGHT",
-        "FOOD PLANT YOU CAN GROW"
-    ]
-
-    for col in required_cols:
-        if col not in df.columns:
-            raise HTTPException(status_code=500, detail=f"Missing column: {col}")
-
-    df["MIN_DIAMETER"] = pd.to_numeric(df["MIN_DIAMETER"], errors="coerce")
-    df["MAX_DIAMETER"] = pd.to_numeric(df["MAX_DIAMETER"], errors="coerce")
-    df["MIN_HEIGHT"] = pd.to_numeric(df["MIN_HEIGHT"], errors="coerce")
-    df["POT HEIGHT"] = pd.to_numeric(df["POT HEIGHT"], errors="coerce")
-
-    df = df.dropna()
-
-    matched_plants = []
-
-    for _, row in df.iterrows():
-        if (
-            row["MIN_DIAMETER"] <= diameter <= row["MAX_DIAMETER"] and
-            row["MIN_HEIGHT"] <= height <= row["POT HEIGHT"]
-        ):
-            plants = str(row["FOOD PLANT YOU CAN GROW"])
-            plant_list = [p.strip() for p in plants.split(",") if p.strip()]
-            matched_plants.extend(plant_list)
-
-    return {
-        "input": {
-            "diameter": diameter,
-            "height": height
-        },
-        "recommended_plants": list(set(matched_plants))
-    }
-
-
-@app.get("/care/{plant_name}")
-async def get_care(plant_name: str):
-    df = load_care_data()
-
-    if df is None:
-        raise HTTPException(status_code=500, detail="Care dataset failed to load")
-
-    required_cols = ["Plant", "How to Grow", "Sunlight", "Care Recommendation"]
-
-    for col in required_cols:
-        if col not in df.columns:
-            raise HTTPException(status_code=500, detail=f"Missing column: {col}")
-
-    df["Plant"] = df["Plant"].astype(str).str.strip().str.lower()
-
-    plant_name_clean = plant_name.strip().lower()
-
-    result = df[df["Plant"].str.contains(plant_name_clean, case=False, na=False)]
-
-    if result.empty:
-        raise HTTPException(status_code=404, detail=f"No care info found for '{plant_name}'")
-
-    response = []
-
-    for _, row in result.iterrows():
-        response.append({
-        "Plant": row["Plant"],
-        "How to Grow": row["How to Grow"],
-        "Sunlight": row["Sunlight"],
-        "Care recommendation": row["Care Recommendation"]
-    })
-
-    return response
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+        image = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not decode image.")
+ 
+    keras_result = predict_plant(model, class_names, image, img_size)
+ 
+    if keras_result["confidence"] >= CONFIDENCE_THRESHOLD:
+        return JSONResponse({
+            "source": "local_model",
+            "plant_name": keras_result["plant_name"],
+            "confidence": round(keras_result["confidence"], 4),
+        })
+ 
+    plantnet_result = await query_plantnet(raw, file.filename)
+    print("PlantNet Result:", plantnet_result)
+    # plantnet_result = await query_plantnet(raw, file.filename or "image.jpg")
+ 
+    if plantnet_result:
+        return JSONResponse({
+            "source": "plantnet",
+            "plant_name": plantnet_result["species"],
+            "scientific_name": plantnet_result.get("scientific_name"),
+            "score": plantnet_result.get("score"),
+            "local_model_confidence": round(keras_result["confidence"], 4),
+        })
+ 
+    raise HTTPException(status_code=404, detail="Plant could not be identified.")
+ 
